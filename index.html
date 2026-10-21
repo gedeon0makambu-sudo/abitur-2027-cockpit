@@ -18,7 +18,7 @@ body:not(.js-ready) .js-only{display:none}
 <section id="settings" class="panel"><h2>Einstellungen & Sicherung</h2><div class="card"><h3>Dein Start</h3><label for="startDate">Tatsächlicher Lernbeginn</label><input id="startDate" type="date"><p class="muted">Frühere Lernblöcke bleiben im Archiv. Sie werden nicht automatisch als versäumt gezählt.</p><label for="weeklyTarget">Wochenziel in Stunden (Orientierung)</label><input id="weeklyTarget" type="number" min="0" max="80" value="52"><p class="muted">Ein Richtwert, keine Pflicht zum Nacharbeiten. Pausen, Schlaf und freie Zeit haben Vorrang.</p><button class="btn" id="saveSettings">Einstellungen speichern</button></div><div class="card" id="eveningPlanner"><h3>🌙 Abendplanung · 3 Vorschläge</h3>
 <p class="muted">Offene Lernblöcke ab deinem tatsächlichen Startdatum werden nur auf deinen Wunsch neu geplant. Bereits erledigte Aufgaben bleiben unverändert. Sonntag bleibt geschützt; bestehende Aufgaben und Termine zählen zur Auslastung.</p>
 <label for="rescheduleDay">Planung ab (heute oder morgen)</label><input id="rescheduleDay" type="date">
-<label for="dailyCap">Maximal geplante Lernminuten pro Tag</label><input id="dailyCap" type="number" min="0" max="720" value="360">
+<label for="dailyCap">Maximal geplante Lernminuten pro Tag (inklusive bestehender Aufgaben und Termine)</label><input id="dailyCap" type="number" min="0" max="720" value="360">
 <label for="planWindow">Zeitraum für Nachholen</label><select id="planWindow"><option value="7">7 Tage</option><option value="14" selected>14 Tage</option><option value="21">21 Tage</option><option value="28">28 Tage</option></select>
 <button id="suggest" class="btn" style="margin-top:12px">Drei Abendvorschläge berechnen</button>
 <div id="suggestions" aria-live="polite"></div><button id="undoStored" class="btn alt" type="button">Letzte bestätigte Abendplanung rückgängig machen</button></div><div class="card"><h3>Datensicherheit</h3><p class="muted">Vor einer Wiederherstellung wird eine neue Sicherheitskopie der aktuellen Daten angeboten. Der Export kann auf dem iPhone zunächst als JSON-Textvorschau erscheinen: über Teilen → In Dateien sichern ablegen.</p></div><div class="card"><h3>Deine Daten gehören dir</h3><div class="actions"><button class="btn green" id="export">Vollständige Sicherung (.json)</button><button class="btn alt" id="csv">Aufgaben als CSV</button></div><label for="restore">Sicherung wiederherstellen</label><input type="file" id="restore" accept="application/json,.json"><p class="muted">Die Daten liegen in diesem Browser auf diesem Gerät. Safari-Daten löschen oder ein anderes Gerät verwenden kann sie entfernen. Sichere sie regelmäßig. Es gibt derzeit keine automatische Cloud-Synchronisierung.</p></div><div class="card"><h3>Technischer Status</h3><p id="tech"></p><p class="muted">Wenn du diese Datei nur in der Dateien-App ansiehst, können Schaltflächen blockiert sein. Für eine zuverlässige iPhone-Nutzung muss sie als HTTPS-Web-App in Safari geöffnet und einmalig zum Home-Bildschirm hinzugefügt werden. Danach startest du sie über ihr eigenes Symbol.</p></div></section>
@@ -66,7 +66,7 @@ function planningStrategy(pool,start,cap,windowDays,mode){
     let pa=priority.includes(a.subject)?0:1,pb=priority.includes(b.subject)?0:1;
     return pa-pb||dateOf(a).localeCompare(dateOf(b));
   }):pool;
-  const dailyExtra=mode==='gentle'?Math.min(45,Math.round(cap*.12)):cap;
+  const dailyExtra=mode==='gentle'?90:cap;
   for(const t of queue){
     let best=null,score=Infinity;
     for(let i=0;i<horizon;i++){
@@ -83,14 +83,17 @@ function planningStrategy(pool,start,cap,windowDays,mode){
     if(best){allocation[best]=(allocation[best]||0)+planned(t);moves.push({id:t.id,from:dateOf(t),to:best,subject:t.subject,task:t.task,minutes:planned(t)})}
     else unscheduled.push(t);
   }
-  return {mode,moves,unscheduled,allocation,horizon,cap,start,windowDays};
+  const reasons={overfull:0,rest:0,noFit:0};
+  for(let i=0;i<horizon;i++){const d=addDays(start,i);if(dayOfWeek(d)===0){reasons.rest++;continue}if(existing[d]+eventMinutes(d)>=cap)reasons.overfull++}
+  reasons.noFit=unscheduled.length;
+  return {mode,moves,unscheduled,allocation,horizon,cap,start,windowDays,reasons};
 }
 function renderEveningPlans(){
   const labels={balanced:'Ausgewogen nachholen',priority:'Prüfungsrelevantes zuerst',gentle:'Entlastet weiterlernen'};
   const explanations={
     balanced:'Verteilt Aufgaben auf weniger belastete Tage innerhalb des gewählten Zeitraums.',
     priority:'Plant zuerst die schriftlichen Prüfungsfächer; bitte passe die Reihenfolge bei Bedarf an deine Prüfungsplanung an.',
-    gentle:'Maximal 45 Zusatzminuten pro Tag, soweit einzelne Lernblöcke hineinpassen; doppelt so langer Zeitraum (bis 56 Tage).'
+    gentle:'Maximal 90 Minuten Nachholen pro Tag, ohne die Tagesgrenze zu überschreiten; doppelt so langer Zeitraum (bis 56 Tage).'
   };
   $('suggestions').innerHTML=eveningPlans.map((p,i)=>{
     const minutes=p.moves.reduce((n,m)=>n+m.minutes,0);
@@ -100,11 +103,11 @@ function renderEveningPlans(){
     return `<div class="card"><h3>${i+1}. ${labels[p.mode]}${p.mode==='balanced'?' ⭐':''}</h3>
       <p class="muted">${explanations[p.mode]}</p>
       <p><b>${p.moves.length}</b> verschiebbar · <b>${minutes}</b> Minuten · <b>${p.unscheduled.length}</b> ohne Platz (${left} Min.)</p>
-      ${p.unscheduled.length?'<p class="notice">Nicht alles passt in diesen Vorschlag. Diese Aufgaben bleiben unverändert offen.</p>':''}
+      ${p.unscheduled.length?`<p class="notice">${p.unscheduled.length} Lernblöcke bleiben unverändert. ${p.reasons.overfull} von ${p.horizon} Tagen sind durch Lernblöcke und Termine bereits an oder über der Tagesgrenze; ${p.reasons.rest} Sonntage bleiben frei. Ganze Lernblöcke werden nur eingeplant, wenn sie vollständig passen.${p.mode==='gentle'?' Bei dieser Strategie sind höchstens 90 zusätzliche Minuten pro Tag erlaubt.':''}</p>`:''}
       <details><summary>Verteilung und Vorschau anzeigen</summary>${dayRows||'<p class="muted">Keine neuen Einträge.</p>'}
       ${sample?`<p class="muted">Beispielaufgaben (maximal 8):</p><ul>${sample}</ul>`:''}</details>
       <button class="btn ${p.mode==='balanced'?'green':'alt'}" data-plan="${i}" ${p.moves.length?'':'disabled'}>Diesen Vorschlag übernehmen</button></div>`;
-  }).join('')+'<p class="muted">Nur bestätigte Vorschläge ändern Aufgaben-Daten. Der Plan verschiebt ausschließlich bereits offene Lernblöcke vor dem gewählten Starttag. Bestehende Termine werden pauschal als belegte Minuten berücksichtigt; eine minutengenaue Kalenderplanung ist noch nicht enthalten.</p>';
+  }).join('')+'<p class="muted">Nur bestätigte Vorschläge ändern Aufgaben-Daten. Der Plan verschiebt ausschließlich bereits offene Lernblöcke vor dem gewählten Starttag. Bestehende Termine werden als belegte Minuten berücksichtigt; eine minutengenaue Kalenderplanung und das Aufteilen von Lernblöcken sind noch nicht enthalten.</p>';
 }
 $('suggest').onclick=()=>{
   const start=$('rescheduleDay').value||TODAY;
